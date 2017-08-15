@@ -5185,7 +5185,7 @@ int voc_start_voice_call(uint32_t session_id)
 		goto fail;
 	}
 #ifdef CONFIG_TOUCHSCREEN_FT5X06
-	in_call = false;
+	in_call = true;
 #endif
 fail:
 	mutex_unlock(&v->lock);

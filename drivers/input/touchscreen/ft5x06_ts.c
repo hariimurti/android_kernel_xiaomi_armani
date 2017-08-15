@@ -29,7 +29,6 @@
 #include <linux/wakelock.h>
 #include <linux/power_supply.h>
 #include <linux/input/mt.h>
-#include <asm-generic/cputime.h>
 #include "ft5x06_ts.h"
 #ifdef CONFIG_STATE_NOTIFIER
 #include <linux/state_notifier.h>
@@ -130,6 +129,29 @@
 #define	BL_VERSION_Z7		1
 #define	BL_VERSION_GZF	2
 
+/* main control dt2w-s2w */
+static int dt2w_switch = 0;
+static int s2w_switch = 0;
+// advanced control
+static int dt2w_feather = 20;
+static int dt2w_timeout = 50;
+static int dt2w_pressure = 40;
+static int s2w_min = 400;
+// others variable
+static int dt2w_switch_stored = 0;
+static bool dt2w_changed = false;
+static int s2w_switch_stored = 0;
+static bool s2w_changed = false;
+static bool touch_cnt = false;
+static bool pwr_on = false;
+static bool rst_panel = false;
+static unsigned int dt_last_x = 0;
+static unsigned int dt_last_y = 0;
+static unsigned int sw_last = 0;
+static unsigned int sw_count = 0;
+static unsigned long dt_time = 0;
+static unsigned long sw_time = 0;
+
 struct upgrade_info {
 	u16	delay_aa;	/*delay of write FT_UPGRADE_AA*/
 	u16	delay_55;	/*delay of write FT_UPGRADE_55*/
@@ -151,7 +173,6 @@ struct ft5x06_finger {
 	int size;
 	int pressure;
 	bool detect;
-	cputime64_t time;
 };
 
 struct ft5x06_tracker {
@@ -181,9 +202,6 @@ struct ft5x06_data {
 	u8 is_usb_plug_in;
 	int current_index;
 	struct input_dev * power_input;
-	struct ft5x06_finger power_finger;
-	int d2w_switch;
-	bool touch_cnt;
 	struct notifier_block notif;
 };
 
@@ -788,7 +806,6 @@ static int ft5x06_collect_finger(struct ft5x06_data *ft5x06,
 		finger[id].y        = ((yh&0x0f)<<8)|yl;
 		finger[id].size     = size;
 		finger[id].pressure = pressure;
-		finger[id].time     = ktime_to_ms(ktime_get());
 		finger[id].detect   = (xh&FT5X0X_EVENT_MASK) != FT5X0X_EVENT_UP;
 
 		if (ft5x06->dbgdump)
@@ -854,6 +871,16 @@ static void ft5x06_apply_filter(struct ft5x06_data *ft5x06,
 	}
 }
 
+static void touch_wake_reset(void)
+{
+	dt_last_x = 0;
+	dt_last_y = 0;
+	dt_time = 0;
+	sw_last = 0;
+	pwr_on = false;
+	//pr_info("touch wake: reset\n");
+}
+
 static void ft5x06_report_touchevent(struct ft5x06_data *ft5x06,
 				struct ft5x06_finger *finger, int count)
 {
@@ -872,55 +899,127 @@ static void ft5x06_report_touchevent(struct ft5x06_data *ft5x06,
 			input_report_abs(ft5x06->input, ABS_MT_TRACKING_ID, -1);
 #endif
 			if (i == 0)
-				ft5x06->touch_cnt = true;
+				touch_cnt = true;
 			continue;
 		}
 
-		if ((ft5x06->in_suspend) && (ft5x06->d2w_switch) && (!(in_call))) {
-			if (ft5x06->touch_cnt == false) {
-				ft5x06->power_finger = finger[i];
-			} else {
-				ft5x06->touch_cnt = false;
-				if (
-					(abs(finger[i].x - ft5x06->power_finger.x) < 50) &&
-					(abs(finger[i].y - ft5x06->power_finger.y) < 50) &&
-					/* (finger[i].time - ft5x06->power_finger.time > 200) && */
-					/* do we need another check for *pretty quick* d2w? */
-					(finger[i].time - ft5x06->power_finger.time < 500)
-					) {
+		if (ft5x06->in_suspend && !in_call && (s2w_switch || dt2w_switch)) {
+			if ((i == 0) && (finger[i].size < 150) && !pwr_on) {
+				if (dt2w_switch) {
+					int delta_x, delta_y;
+					long delta_t;
+
+					delta_x = abs(finger[i].x - dt_last_x);
+					delta_y = abs(finger[i].y - dt_last_y);
+					delta_t = jiffies - dt_time;
+
+					if ((finger[i].pressure > dt2w_pressure) &&
+						(finger[i].y >= 600) && (finger[i].y <= 1000) &&
+						(finger[i].x >= 200) && (finger[i].x <= 500)) {
+
+						if (touch_cnt) {
+							touch_cnt = false;
+							if ((delta_x <= dt2w_feather) && (delta_y <= dt2w_feather) &&
+								(delta_t <= dt2w_timeout)) {
+
+								pwr_on = true;
+								//pr_info("touch wake: doubletap to wake has been triggered\n");
+							}
+						} else {
+							if ((dt_last_x != finger[i].x) && (dt_last_y != finger[i].y)) {
+								dt_last_x = finger[i].x;
+				    			dt_last_y = finger[i].y;
+				    			dt_time = jiffies;
+							}
+						}
+					}
+
+					if ((finger[i].y == 1344) && (finger[i].x == 360)) {
+						if (touch_cnt) {
+							touch_cnt = false;
+							if ((finger[i].pressure > 18) && (delta_t <= dt2w_timeout)) {
+								pwr_on = true;
+								//pr_info("touch wake: doubletap to wake has been triggered\n");
+							}
+						} else {
+							dt_time = jiffies;
+						}
+					}
+				}
+
+				if ((finger[i].y >= 1000) && s2w_switch) {
+					int s2w_timeout, movement, max_move;
+					long delta_t;
+
+					if ((sw_last == 0) || (sw_last > finger[i].x)) {
+						sw_count = 0;
+						sw_time = jiffies;
+						sw_last = finger[i].x;
+					}
+
+					if ((sw_last < finger[i].x) && (sw_last != finger[i].x)) {
+						movement = finger[i].x - sw_last;
+						sw_last = finger[i].x;
+
+						if (finger[i].y == 1344) {
+							max_move = 210;
+						} else {
+							max_move = 50;
+						}
+
+						if (movement <= max_move) {
+							sw_count += movement;
+						}
+					}
+
+					s2w_timeout = dt2w_timeout * 2;
+					delta_t = jiffies - sw_time;
+
+					if ((delta_t <= s2w_timeout) && (sw_count >= s2w_min)) {
+						sw_last = 0;
+						pwr_on = true;
+						//pr_info("touch wake: sweep to wake has been triggered\n");
+					} else if (delta_t > s2w_timeout) {
+						sw_last = 0;
+					}
+				}
+
+				if (pwr_on) {
 					input_report_key(ft5x06->power_input, KEY_POWER, 1);
 					input_report_key(ft5x06->power_input, KEY_POWER, 0);
 					input_sync(ft5x06->power_input);
-					pr_info("%s: d2w: power key sent\n", __func__);
-				} else
-					ft5x06->power_finger = finger[i];
+					pr_info("touch wake: power-key sent\n");
+				}
+			} else {
+				touch_wake_reset();
 			}
 		} else if (ft5x06->in_suspend && in_call) {
-			; // in phone_call; do nothing.
+			pr_info("touch wake: phone in call mode. do nothing");
 		} else {
 #ifdef CONFIG_TOUCHSCREEN_FT5X06_TYPEB
-		input_mt_report_slot_state(ft5x06->input, MT_TOOL_FINGER, 1);
+			input_mt_report_slot_state(ft5x06->input, MT_TOOL_FINGER, 1);
 #endif
-		input_report_abs(ft5x06->input, ABS_MT_TRACKING_ID, i);
-		input_report_abs(ft5x06->input, ABS_MT_POSITION_X ,
-			max(1, finger[i].x)); /* for fruit ninja */
-		input_report_abs(ft5x06->input, ABS_MT_POSITION_Y ,
-			max(1, finger[i].y)); /* for fruit ninja */
-		input_report_abs(ft5x06->input, ABS_MT_TOUCH_MAJOR,
-			max(1, finger[i].pressure));
-		input_report_abs(ft5x06->input, ABS_MT_WIDTH_MAJOR,
-			max(1, finger[i].size));
+			input_report_abs(ft5x06->input, ABS_MT_TRACKING_ID, i);
+			input_report_abs(ft5x06->input, ABS_MT_POSITION_X ,
+				max(1, finger[i].x)); /* for fruit ninja */
+			input_report_abs(ft5x06->input, ABS_MT_POSITION_Y ,
+				max(1, finger[i].y)); /* for fruit ninja */
+			input_report_abs(ft5x06->input, ABS_MT_TOUCH_MAJOR,
+				max(1, finger[i].pressure));
+			input_report_abs(ft5x06->input, ABS_MT_WIDTH_MAJOR,
+				max(1, finger[i].size));
 #ifndef CONFIG_TOUCHSCREEN_FT5X06_TYPEB
-		input_mt_sync(ft5x06->input);
-		mt_sync_sent = true;
+			input_mt_sync(ft5x06->input);
+			mt_sync_sent = true;
 #endif
-		if (ft5x06->dbgdump)
-			dev_info(ft5x06->dev,
+			if (ft5x06->dbgdump)
+				dev_info(ft5x06->dev,
 				"tch(%02d): %04d %04d %03d %03d\n",
 				i, finger[i].x, finger[i].y,
 				finger[i].pressure, finger[i].size);
 		}
 	}
+
 #ifndef CONFIG_TOUCHSCREEN_FT5X06_TYPEB
 	if (!mt_sync_sent) {
 		input_mt_sync(ft5x06->input);
@@ -943,8 +1042,10 @@ static irqreturn_t ft5x06_interrupt(int irq, void *dev_id)
 	if (error >= 0) {
 		ft5x06_apply_filter(ft5x06, finger, FT5X0X_MAX_FINGER);
 		ft5x06_report_touchevent(ft5x06, finger, FT5X0X_MAX_FINGER);
-	} else
+	} else {
+		rst_panel = true;
 		dev_err(ft5x06->dev, "fail to collect finger(%d)\n", error);
+	}
 	mutex_unlock(&ft5x06->mutex);
 
 	return IRQ_HANDLED;
@@ -954,16 +1055,26 @@ int ft5x06_suspend(struct ft5x06_data *ft5x06)
 {
 	int error = 0;
 
-	if (ft5x06->d2w_switch)
+	if (dt2w_changed) {
+		dt2w_switch = dt2w_switch_stored;
+		dt2w_changed = false;
+		pr_info("touch wake: %s double tap to wake", dt2w_switch ? "enabling" : "disabling");
+	}
+	if (s2w_changed) {
+		s2w_switch = s2w_switch_stored;
+		s2w_changed = false;
+		pr_info("touch wake: %s sweep tap to wake", s2w_switch ? "enabling" : "disabling");
+	}
+
+	if (dt2w_switch || s2w_switch)
 		enable_irq_wake(ft5x06->irq);
 	else
 		disable_irq(ft5x06->irq);
 	mutex_lock(&ft5x06->mutex);
 	memset(ft5x06->tracker, 0, sizeof(ft5x06->tracker));
 
-	ft5x06->in_suspend = true;
 	cancel_delayed_work_sync(&ft5x06->noise_filter_delayed_work);
-	if (ft5x06->d2w_switch)
+	if (dt2w_switch || s2w_switch)
 		error = ft5x06_write_byte(ft5x06,
 				FT5X0X_ID_G_PMODE, FT5X0X_POWER_MONITOR);
 	else
@@ -971,6 +1082,7 @@ int ft5x06_suspend(struct ft5x06_data *ft5x06)
 				FT5X0X_ID_G_PMODE, FT5X0X_POWER_HIBERNATE);
 
 	mutex_unlock(&ft5x06->mutex);
+	ft5x06->in_suspend = true;
 
 	return error;
 }
@@ -982,23 +1094,45 @@ int ft5x06_resume(struct ft5x06_data *ft5x06)
 
 	mutex_lock(&ft5x06->mutex);
 
-	if (!ft5x06->d2w_switch) { // if !d2w enabled, device goes to hibernate.
-		//reset iff in hibernate mode
+	if ((!dt2w_switch && !s2w_switch) || rst_panel) {
+		if (rst_panel) {
+			disable_irq(ft5x06->irq);
+		}
+
 		/* reset device */
 		gpio_set_value_cansleep(pdata->reset_gpio, 0);
 		msleep(20);
 		gpio_set_value_cansleep(pdata->reset_gpio, 1);
 		msleep(50);
+
+		if (rst_panel) {
+			enable_irq(ft5x06->irq);
+			rst_panel = false;
+		}
 	}
 
 	schedule_delayed_work(&ft5x06->noise_filter_delayed_work,
 				NOISE_FILTER_DELAY);
-	ft5x06->in_suspend = false;
 	mutex_unlock(&ft5x06->mutex);
-	if (ft5x06->d2w_switch)
+
+	if (dt2w_switch || s2w_switch)
 		disable_irq_wake(ft5x06->irq);
 	else
 		enable_irq(ft5x06->irq);
+
+	if (dt2w_changed) {
+		dt2w_switch = dt2w_switch_stored;
+		dt2w_changed = false;
+		pr_info("touch wake: %s double tap to wake", dt2w_switch ? "enabling" : "disabling");
+	}
+	if (s2w_changed) {
+		s2w_switch = s2w_switch_stored;
+		s2w_changed = false;
+		pr_info("touch wake: %s sweep tap to wake", s2w_switch ? "enabling" : "disabling");
+	}
+
+	ft5x06->in_suspend = false;
+	touch_wake_reset();
 
 	return 0;
 }
@@ -1027,8 +1161,8 @@ static int state_notifier_callback(struct notifier_block *self,
 				break;
 		}
 
-   		// reset touch_cnt variable upon State unblank
-		ft5x06->touch_cnt = false;
+		// reset touch_cnt variable upon State unblank
+		touch_cnt = false;
 	}
 
 	return NOTIFY_OK;
@@ -1065,7 +1199,7 @@ static int fb_notifier_callback(struct notifier_block *self,
 		}
 
 		// reset touch_cnt variable upon FB blank
-		ft5x06->touch_cnt = false;
+		touch_cnt = false;
 	}
 
 	return 0;
@@ -1495,49 +1629,207 @@ static ssize_t ft5x06_selftest_show(struct device *dev,
 	return sprintf(&buf[0], "%u\n", ft5x06->test_result);
 }
 
-static ssize_t ft5x06_d2w_switch_show(struct device *dev,
+/* touchwake sysfs */
+static ssize_t ft5x06_dt2w_switch_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	struct ft5x06_data *ft5x06 = dev_get_drvdata(dev);
+	size_t count = 0;
 
-	return sprintf(buf, "%d\n", ft5x06->d2w_switch);
+	count += sprintf(buf, "%d\n", dt2w_switch);
+
+	return count;
 }
 
-static ssize_t ft5x06_d2w_switch_store(struct device *dev,
+static ssize_t ft5x06_dt2w_switch_store(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count)
 {
-	struct ft5x06_data *ft5x06 = dev_get_drvdata(dev);
-	struct ft5x06_ts_platform_data *pdata = ft5x06->dev->platform_data;
-
-	if (buf[0] == '0') {
-		if (ft5x06->in_suspend) {
-			if (ft5x06->d2w_switch) {
-				disable_irq_wake(ft5x06->irq);
-				disable_irq(ft5x06->irq);
+	if (buf[0] >= '0' && buf[0] <= '1' && buf[1] == '\n') {
+		int value = buf[0] - '0';
+		if ((dt2w_switch != value) && !dt2w_changed) {
+			dt2w_switch_stored = value;
+			dt2w_changed = true;
+			pr_info("touch wake: dt2w %s: applied after the screen on/off\n", value ? "on" : "off");
+		} else {
+			if ((dt2w_switch_stored != value) && dt2w_changed) {
+				dt2w_changed = false;
+				pr_info("touch wake: dt2w %s: abort changing\n", dt2w_switch ? "on" : "off");
 			}
 		}
-		ft5x06->d2w_switch = 0;
-	} else if (buf[0] == '1') {
-		if (ft5x06->in_suspend) {
-			if (ft5x06->d2w_switch == 0) {
-				/* reset panel */
-				mutex_lock(&ft5x06->mutex);
-				gpio_set_value_cansleep(pdata->reset_gpio, 0);
-				msleep(20);
-				gpio_set_value_cansleep(pdata->reset_gpio, 1);
-				msleep(50);
-				mutex_unlock(&ft5x06->mutex);
-
-				enable_irq(ft5x06->irq);
-				enable_irq_wake(ft5x06->irq);
-			}
-		}
-		ft5x06->d2w_switch = 1;
 	}
 
 	return count;
 }
+
+static ssize_t ft5x06_dt2w_timeout_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	size_t count = 0;
+
+	count += sprintf(buf, "%d\n", dt2w_timeout);
+
+	return count;
+}
+
+static ssize_t ft5x06_dt2w_timeout_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int value = 0;
+	int ret = sscanf(buf, "%d", &value);
+
+	if (ret) {
+		if ((value < 10) || (value > 200)) {
+			pr_info("touch wake: timeout: %d is invalid value! should be 10-200\n", value);
+		} else if (dt2w_timeout != value) {
+			dt2w_timeout = value;
+			pr_info("touch wake: timeout: set %dms\n", value);
+		}
+	}
+
+	return count;
+}
+
+static ssize_t ft5x06_dt2w_feather_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	size_t count = 0;
+
+	count += sprintf(buf, "%d\n", dt2w_feather);
+
+	return count;
+}
+
+static ssize_t ft5x06_dt2w_feather_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int value = 0;
+	int ret = sscanf(buf, "%d", &value);
+
+	if (ret) {
+		if ((value < 5) || (value > 100)) {
+			pr_info("touch wake: dt2w feather: %d is invalid value! should be 5-100\n", value);
+		} else if (dt2w_feather != value) {
+			dt2w_feather = value;
+			pr_info("touch wake: dt2w feather: set %dpx\n", value);
+		}
+	}
+
+	return count;
+}
+
+static ssize_t ft5x06_dt2w_pressure_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	size_t count = 0;
+
+	count += sprintf(buf, "%d\n", dt2w_pressure);
+
+	return count;
+}
+
+static ssize_t ft5x06_dt2w_pressure_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int value = 0;
+	int ret = sscanf(buf, "%d", &value);
+
+	if (ret) {
+		if ((value < 0) || (value > 100)) {
+			pr_info("touch wake: dt2w pressure: %d is invalid value! should be 0-100\n", value);
+		} else if (dt2w_pressure != value) {
+			dt2w_pressure = value;
+			pr_info("touch wake: dt2w pressure: set %d\n", value);
+		}
+	}
+
+	return count;
+}
+
+static ssize_t ft5x06_s2w_switch_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	size_t count = 0;
+
+	count += sprintf(buf, "%d\n", s2w_switch);
+
+	return count;
+}
+
+static ssize_t ft5x06_s2w_switch_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	if (buf[0] >= '0' && buf[0] <= '1' && buf[1] == '\n') {
+		int value = buf[0] - '0';
+		if ((s2w_switch != value) && !s2w_changed) {
+			s2w_switch_stored = value;
+			s2w_changed = true;
+			pr_info("touch wake: s2w %s: applied after the screen on/off\n", value ? "on" : "off");
+		} else {
+			if ((s2w_switch_stored != value) && s2w_changed) {
+				s2w_changed = false;
+				pr_info("touch wake: s2w %s: abort changing\n", s2w_switch ? "on" : "off");
+			}
+		}
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR(doubletap_wake, 0644, ft5x06_dt2w_switch_show, ft5x06_dt2w_switch_store);
+static DEVICE_ATTR(doubletap_timeout, 0644, ft5x06_dt2w_timeout_show, ft5x06_dt2w_timeout_store);
+static DEVICE_ATTR(doubletap_feather, 0644, ft5x06_dt2w_feather_show, ft5x06_dt2w_feather_store);
+static DEVICE_ATTR(doubletap_pressure, 0644, ft5x06_dt2w_pressure_show, ft5x06_dt2w_pressure_store);
+static DEVICE_ATTR(sweep_wake, 0644, ft5x06_s2w_switch_show, ft5x06_s2w_switch_store);
+
+static struct kobject *android_touch_kobj;
+
+static int doubletap_wake_sysfs_init(void)
+{
+	int ret;
+
+	android_touch_kobj = kobject_create_and_add("android_touch", NULL) ;
+	if (android_touch_kobj == NULL) {
+		pr_info("%s: touch wake: subsystem_register failed\n", __func__);
+		ret = -ENOMEM;
+		return ret;
+	}
+	ret = sysfs_create_file(android_touch_kobj, &dev_attr_doubletap_timeout.attr);
+	if (ret) {
+		pr_info("%s: touch wake: sysfs_create_file failed for doubletap_timeout\n", __func__);
+		return ret;
+	}
+	ret = sysfs_create_file(android_touch_kobj, &dev_attr_doubletap_feather.attr);
+	if (ret) {
+		pr_info("%s: touch wake: sysfs_create_file failed for doubletap_feather\n", __func__);
+		return ret;
+	}
+	ret = sysfs_create_file(android_touch_kobj, &dev_attr_doubletap_pressure.attr);
+	if (ret) {
+		pr_info("%s: touch wake: sysfs_create_file failed for doubletap_pressure\n", __func__);
+		return ret;
+	}
+	ret = sysfs_create_file(android_touch_kobj, &dev_attr_doubletap_wake.attr);
+	if (ret) {
+		pr_info("%s: touch wake: sysfs_create_file failed for doubletap_wake\n", __func__);
+		return ret;
+	}
+	ret = sysfs_create_file(android_touch_kobj, &dev_attr_sweep_wake.attr);
+	if (ret) {
+		pr_info("%s: touch wake: sysfs_create_file failed for sweep_wake\n", __func__);
+		return ret;
+	}
+	return 0;
+}
+
+static void doubletap_wake_sysfs_deinit(void)
+{
+	kobject_del(android_touch_kobj);
+}
+/* end touchwake sysfs */
 
 /* sysfs */
 static DEVICE_ATTR(tpfwver, 0644, ft5x06_tpfwver_show, NULL);
@@ -1546,7 +1838,6 @@ static DEVICE_ATTR(dbgdump, 0644, ft5x06_dbgdump_show, ft5x06_dbgdump_store);
 static DEVICE_ATTR(updatefw, 0200, NULL, ft5x06_updatefw_store);
 static DEVICE_ATTR(rawdatashow, 0644, ft5x06_rawdata_show, NULL);
 static DEVICE_ATTR(selftest, 0644, ft5x06_selftest_show, ft5x06_selftest_store);
-static DEVICE_ATTR(d2w_switch, 0644, ft5x06_d2w_switch_show, ft5x06_d2w_switch_store);
 
 static struct attribute *ft5x06_attrs[] = {
 	&dev_attr_tpfwver.attr,
@@ -1555,7 +1846,6 @@ static struct attribute *ft5x06_attrs[] = {
 	&dev_attr_updatefw.attr,
 	&dev_attr_rawdatashow.attr,
 	&dev_attr_selftest.attr,
-	&dev_attr_d2w_switch.attr,
 	NULL
 };
 
@@ -2003,10 +2293,8 @@ struct ft5x06_data *ft5x06_probe(struct device *dev,
 	set_bit(EV_KEY, ft5x06->input->evbit);
 	set_bit(EV_ABS, ft5x06->input->evbit);
 
+	/* read chip data */
 	// POWER
-	memset(&ft5x06->power_finger, 0, sizeof(ft5x06->power_finger));
-	ft5x06->d2w_switch = 0; // disable d2w by default
-	ft5x06->touch_cnt = false; // touch_cnt variable false by default
 	ft5x06->power_input = input_allocate_device();
 	if (!ft5x06->power_input)
 	{
@@ -2023,9 +2311,14 @@ struct ft5x06_data *ft5x06_probe(struct device *dev,
 		dev_err(dev, "failed to register power key device\n");
 		goto err_free_input;
 	}
+
+	error = doubletap_wake_sysfs_init(); // dt2wake sysfs
+	if (error) {
+		dev_err(dev, "failed to initialize dt2w sysfs\n");
+		goto err_free_input;
+	}
 	// POWER
 
-	/* read chip data */
 	error = ft5x06_read_byte(ft5x06, FT5X0X_REG_CHIP_ID, &ft5x06->chip_id);
 	if (error) {
 		dev_err(dev, "failed to read chip id\n");
@@ -2145,6 +2438,7 @@ void ft5x06_remove(struct ft5x06_data *ft5x06)
 {
 	struct ft5x06_ts_platform_data *pdata = ft5x06->dev->platform_data;
 
+	doubletap_wake_sysfs_deinit(); // dt2wake sysfs
 	cancel_delayed_work_sync(&ft5x06->noise_filter_delayed_work);
 	unregister_power_supply_notifier(&ft5x06->power_supply_notifier);
 #ifdef CONFIG_STATE_NOTIFIER
